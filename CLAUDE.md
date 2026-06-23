@@ -19,11 +19,13 @@ python3 heatmap.py --pid <PID> --interval 2.0
 - `p` — view PSS (shared cost)
 - `o` — view Private (exclusively owned)
 - `s` — view Swap (on disk)
+- `h` — toggle help overlay (metric descriptions + leak legend)
 - `q` — quit
 
 ## Project structure
 - `heatmap.py` — main file, contains everything
-- `demo_process.py` — test process that allocates memory for profiling
+- `demo_process.py` — test process that allocates varied memory (heap, mmap file, anonymous)
+- `leaky_process.py` — process that leaks ~2 MB/sec into the heap to demo leak detection
 
 ## Key implementation details
 - Squarified treemap algorithm (Bruls et al. 2000) for rectangle layout

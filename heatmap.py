@@ -220,26 +220,26 @@ class Canvas:
         self.w, self.h = width, height
         self.cells = [[(' ', '') for _ in range(width)] for _ in range(height)]
 
-    def fill(self, x, y, w, h, label, value_str, pct_str, category):
+    def fill(self, x, y, w, h, label, value_str, pct_str, category, warn=False):
         bg_c, fg_c = CATEGORY_STYLE.get(category, CATEGORY_STYLE['other'])
         bg = _bg(bg_c)
         fg_bold = f'1;{_fg(fg_c)};{bg}'
         fg_dim = f'2;{_fg(fg_c)};{bg}'
+        # leaking regions get a bright warning border so they pop out
+        edge_style = f'1;{_fg(196)};{bg}' if warn else f'2;{bg}'
         x0, y0 = int(round(x)), int(round(y))
         x1, y1 = int(round(x + w)), int(round(y + h))
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(self.w, x1), min(self.h, y1)
-        # draw border cells with dim style, inner cells with bg
         for ry in range(y0, y1):
             for rx in range(x0, x1):
                 is_edge = (ry == y0 or ry == y1 - 1 or rx == x0 or rx == x1 - 1)
-                if is_edge:
-                    self.cells[ry][rx] = (' ', f'2;{bg}')
-                else:
-                    self.cells[ry][rx] = (' ', bg)
+                self.cells[ry][rx] = (' ', edge_style if is_edge else bg)
         box_w = x1 - x0
         box_h = y1 - y0
         inner_w = box_w - 2
+        if warn:
+            label = '⚠ ' + label  # ⚠ prefix
         if inner_w >= 3 and box_h >= 2:
             text = label[:inner_w]
             for j, ch in enumerate(text):
@@ -286,17 +286,49 @@ def human(kb):
     return f'{mb:.1f} MB'
 
 
-def build_frame(pid, metric, width, height):
+def build_help(width, height):
+    """A framed overlay explaining each metric and the leak indicator."""
+    border_top = '╭' + '─' * (width - 2) + '╮'
+    border_bot = '╰' + '─' * (width - 2) + '╯'
+    lines = ['', '  \033[1mWhat the metrics mean\033[0m', '']
+    for key, name in METRICS.items():
+        short = name.split(' (')[0]
+        lines.append(f'  \033[1m{short:<8}\033[0m \033[2m{METRIC_HELP[key]}\033[0m')
+    lines += ['',
+              '  \033[1;38;5;196m⚠\033[0m  a region with this border is \033[1mleaking\033[0m —',
+              '     its Private memory has been climbing steadily.',
+              '']
+    # pad the box out to the treemap height so centering stays put
+    body = lines + [''] * max(0, height - len(lines))
+    body = body[:height]
+    header = '\033[1m Help \033[0m \033[2m— press any key to return\033[0m'
+    keys = '\033[2m[r]RSS [p]PSS [o]Private [s]Swap [h]help [q]quit\033[0m'
+    return (header + '\n' + border_top + '\n' + '\n'.join(body) +
+            '\n' + border_bot + '\n' + '\n' + keys)
+
+
+def build_frame(pid, metric, width, height, detector=None):
     regions = parse_smaps(pid)
     groups = group_regions(regions)
     total = sum(g[metric] for g in groups)
 
+    leak_labels, banner = set(), ''
+    if detector is not None:
+        detector.update(groups)
+        leaks = detector.leaks()
+        leak_labels = {label for label, _, _ in leaks}
+        if leaks:
+            label, rate, _ = leaks[0]
+            extra = f' (+{len(leaks) - 1} more)' if len(leaks) > 1 else ''
+            banner = f'  \033[1;38;5;196m⚠ LEAK {label} +{rate:.0f} MB/min{extra}\033[0m'
+
     header = (f'\033[1m PID {pid}\033[0m  {get_proc_name(pid)}  '
-              f'\033[2m│\033[0m  {METRICS[metric].split(" (")[0]}: \033[1m{human(total)}\033[0m')
+              f'\033[2m│\033[0m  {METRICS[metric].split(" (")[0]}: \033[1m{human(total)}\033[0m'
+              + banner)
 
     legend = '  '.join(f'\033[{_bg(bg)}m  \033[0m \033[2m{cat}\033[0m'
                        for cat, (bg, _) in CATEGORY_STYLE.items() if cat != 'other')
-    keys = ('\033[2m[r]RSS [p]PSS [o]Private [s]Swap [q]quit\033[0m   '
+    keys = ('\033[2m[r]RSS [p]PSS [o]Private [s]Swap [h]help [q]quit\033[0m   '
             f'\033[1mviewing: {METRICS[metric]}\033[0m')
 
     border_top = '╭' + '─' * (width - 2) + '╮'
@@ -320,7 +352,8 @@ def build_frame(pid, metric, width, height):
     canvas = Canvas(width, height)
     for g, (x, y, w, h) in zip(big, rects):
         pct = f'{g[metric] / total * 100:.0f}%'
-        canvas.fill(x, y, w, h, g['label'], human(g[metric]), pct, g['category'])
+        canvas.fill(x, y, w, h, g['label'], human(g[metric]), pct, g['category'],
+                    warn=g['label'] in leak_labels)
 
     return header + '\n' + border_top + '\n' + canvas.render() + '\n' + border_bot + '\n' + legend + '\n' + keys
 
@@ -338,13 +371,18 @@ def main(pid, interval, metric):
     if interactive:
         tty.setcbreak(sys.stdin.fileno())
     sys.stdout.write('\033[?25l\033[2J')  # hide cursor, clear screen
+    detector = LeakDetector()
+    show_help = False
     try:
         while True:
             size = shutil.get_terminal_size((80, 24))
             cw = max(40, size.columns // 2)
             ch = max(5, size.lines // 2)
             try:
-                frame = build_frame(pid, metric, cw, ch)
+                if show_help:
+                    frame = build_help(cw, ch)
+                else:
+                    frame = build_frame(pid, metric, cw, ch, detector)
             except FileNotFoundError:
                 sys.stdout.write('\033[2J\033[H')
                 print(f'Process {pid} not found or has exited.')
@@ -360,8 +398,12 @@ def main(pid, interval, metric):
                 r, _, _ = select.select([sys.stdin], [], [], interval)
                 if r:
                     c = sys.stdin.read(1)
+                    if show_help:
+                        show_help = False  # any key dismisses help
+                        continue
                     if c == 'q':
                         break
+                    elif c == 'h': show_help = True
                     elif c == 'r': metric = 'rss'
                     elif c == 'p': metric = 'pss'
                     elif c == 'o': metric = 'private'
