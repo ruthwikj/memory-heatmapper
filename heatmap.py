@@ -218,36 +218,39 @@ def squarify(sizes, x, y, dx, dy):
 class Canvas:
     def __init__(self, width, height):
         self.w, self.h = width, height
-        self.cells = [[(' ', '') for _ in range(width)] for _ in range(height)]
+        sep = _bg(235)
+        self.cells = [[(' ', sep) for _ in range(width)] for _ in range(height)]
 
     def fill(self, x, y, w, h, label, value_str, pct_str, category, warn=False):
         bg_c, fg_c = CATEGORY_STYLE.get(category, CATEGORY_STYLE['other'])
         bg = _bg(bg_c)
         fg_bold = f'1;{_fg(fg_c)};{bg}'
         fg_dim = f'2;{_fg(fg_c)};{bg}'
-        # leaking regions get a bright warning border so they pop out
-        edge_style = f'1;{_fg(196)};{bg}' if warn else f'2;{bg}'
         x0, y0 = int(round(x)), int(round(y))
         x1, y1 = int(round(x + w)), int(round(y + h))
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(self.w, x1), min(self.h, y1)
-        for ry in range(y0, y1):
-            for rx in range(x0, x1):
-                is_edge = (ry == y0 or ry == y1 - 1 or rx == x0 or rx == x1 - 1)
-                self.cells[ry][rx] = (' ', edge_style if is_edge else bg)
-        box_w = x1 - x0
-        box_h = y1 - y0
-        inner_w = box_w - 2
+        fill_x1 = max(x0, x1 - 1)
+        fill_y1 = max(y0, y1 - 1)
+        for ry in range(y0, fill_y1):
+            for rx in range(x0, fill_x1):
+                self.cells[ry][rx] = (' ', bg)
         if warn:
-            label = '⚠ ' + label  # ⚠ prefix
-        if inner_w >= 3 and box_h >= 2:
-            text = label[:inner_w]
+            for ry in range(y0, y1):
+                for rx in range(x0, x1):
+                    if ry == y0 or ry == y1 - 1 or rx == x0 or rx == x1 - 1:
+                        self.cells[ry][rx] = (' ', f'1;{_fg(196)};{_bg(235)}')
+            label = '⚠ ' + label
+        box_w = fill_x1 - x0
+        box_h = fill_y1 - y0
+        if box_w >= 3 and box_h >= 1:
+            text = label[:box_w - 1]
             for j, ch in enumerate(text):
-                self.cells[y0 + 1][x0 + 1 + j] = (ch, fg_bold)
-        if inner_w >= 3 and box_h >= 3:
-            text = f'{value_str}  {pct_str}'[:inner_w]
+                self.cells[y0][x0 + 1 + j] = (ch, fg_bold)
+        if box_w >= 3 and box_h >= 2:
+            text = f'{value_str}  {pct_str}'[:box_w - 1]
             for j, ch in enumerate(text):
-                self.cells[y0 + 2][x0 + 1 + j] = (ch, fg_dim)
+                self.cells[y0 + 1][x0 + 1 + j] = (ch, fg_dim)
 
     def render(self):
         lines = []
@@ -346,16 +349,30 @@ def build_frame(pid, metric, width, height, detector=None):
                     metric: sum(g[metric] for g in small)})
     big.sort(key=lambda g: -g[metric])
 
-    sizes = normalize_sizes([g[metric] for g in big], width, height)
-    rects = squarify(sizes, 0, 0, width, height)
+    vw = width / 2
+    sizes = normalize_sizes([g[metric] for g in big], vw, height)
+    rects = squarify(sizes, 0, 0, vw, height)
 
     canvas = Canvas(width, height)
     for g, (x, y, w, h) in zip(big, rects):
         pct = f'{g[metric] / total * 100:.0f}%'
-        canvas.fill(x, y, w, h, g['label'], human(g[metric]), pct, g['category'],
+        canvas.fill(x * 2, y, w * 2, h, g['label'], human(g[metric]), pct, g['category'],
                     warn=g['label'] in leak_labels)
 
-    return header + '\n' + border_top + '\n' + canvas.render() + '\n' + border_bot + '\n' + legend + '\n' + keys
+    detail_lines = []
+    for g in big:
+        bg_c, _ = CATEGORY_STYLE.get(g['category'], CATEGORY_STYLE['other'])
+        swatch = f'\033[{_bg(bg_c)}m  \033[0m'
+        pct = g[metric] / total * 100
+        name = g['label'][:20]
+        warn_mark = ' \033[1;38;5;196m⚠\033[0m' if g['label'] in leak_labels else ''
+        detail_lines.append(
+            f'  {swatch} {name:<20s} \033[2m{human(g[metric]):>10s}  {pct:5.1f}%\033[0m{warn_mark}')
+
+    details = '\n'.join(detail_lines)
+
+    return (header + '\n' + border_top + '\n' + canvas.render() + '\n' + border_bot
+            + '\n' + details + '\n' + legend + '\n' + keys)
 
 
 # ---------------------------------------------------------------------------
