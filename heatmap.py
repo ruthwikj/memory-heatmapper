@@ -5,6 +5,7 @@ import select
 import termios
 import tty
 import shutil
+from collections import deque
 import click
 
 # 256-color palette: (bg color index, fg color index)
@@ -28,6 +29,14 @@ METRICS = {
     'pss':     'PSS (shared cost)',
     'private': 'Private (owned)',
     'swap':    'Swap (on disk)',
+}
+
+# one-liners for the [h]elp overlay — what a dev actually cares about
+METRIC_HELP = {
+    'rss':     'physical RAM footprint (shared + private)',
+    'pss':     'true cost per process (shared / users + private)',
+    'private': 'memory owned exclusively (grows = likely leak)',
+    'swap':    'paged out to disk (high = memory pressure)',
 }
 
 
@@ -93,6 +102,57 @@ def group_regions(regions):
         for k in ('rss', 'pss', 'private', 'swap'):
             g[k] += r[k]
     return list(groups.values())
+
+
+# ---------------------------------------------------------------------------
+# 1b. LEAK DETECTION — track per-region Private memory growth over time
+# ---------------------------------------------------------------------------
+class LeakDetector:
+    """Watches each region's Private memory and flags sustained growth.
+
+    Leaks show up as private (owned) memory that keeps climbing, so we keep a
+    rolling window of samples per region and report any that have grown
+    meaningfully and mostly-monotonically across the window.
+    """
+
+    def __init__(self, window=15):
+        self.window = window
+        self.history = {}  # label -> deque[(timestamp, private_kb)]
+
+    def update(self, groups):
+        now = time.time()
+        seen = set()
+        for g in groups:
+            seen.add(g['label'])
+            dq = self.history.setdefault(g['label'], deque(maxlen=self.window))
+            dq.append((now, g['private']))
+        for label in list(self.history):
+            if label not in seen:
+                del self.history[label]
+
+    def leaks(self):
+        """Return [(label, rate_mb_per_min, delta_kb)] for growing regions, worst first."""
+        out = []
+        for label, dq in self.history.items():
+            if len(dq) < 5:
+                continue
+            (t0, v0), (t1, v1) = dq[0], dq[-1]
+            dt = t1 - t0
+            delta = v1 - v0
+            if dt <= 0:
+                continue
+            # meaningful (>1 MB and >5%) and mostly rising across the window
+            if delta > 1024 and v1 > v0 * 1.05 and self._mostly_rising(dq):
+                rate = (delta / 1024) / (dt / 60)  # MB per minute
+                out.append((label, rate, delta))
+        out.sort(key=lambda x: -x[1])
+        return out
+
+    @staticmethod
+    def _mostly_rising(dq):
+        vals = [v for _, v in dq]
+        ups = sum(1 for a, b in zip(vals, vals[1:]) if b >= a)
+        return ups >= 0.7 * (len(vals) - 1)
 
 
 # ---------------------------------------------------------------------------
